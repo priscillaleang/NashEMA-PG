@@ -4,6 +4,7 @@ from flax import nnx
 import chex
 import abc
 import distrax
+import jax
 import orbax.checkpoint as ocp
 
 import envs.mytypes as env_types
