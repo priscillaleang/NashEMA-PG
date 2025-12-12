@@ -1,5 +1,9 @@
 import train.mytypes as train_types
 from agents import BaseAgent
+from train.core.control_variate import (
+    compute_is_weighted_rho_gradient,
+    apply_cv_correction,
+)
 
 from typing import Any, Literal, Optional, Tuple, Union
 from functools import partial
@@ -15,8 +19,12 @@ class UpdateState:
     optimizer: nnx.Optimizer
     metrics: nnx.MultiMetric
     key: chex.PRNGKey
+    # Control Variate fields (Optional - only used when CV is enabled)
+    cv_baseline_grad: Optional[Any] = None
+    cv_rho_graphdef: Optional[Any] = None
+    cv_rho_state: Optional[Any] = None
 
-@partial(nnx.jit, static_argnames=('num_minibatches', 'num_ppo_epoch', 'only_use_player0_experience', 'mag_divergence_type'))
+@partial(nnx.jit, static_argnames=('num_minibatches', 'num_ppo_epoch', 'only_use_player0_experience', 'mag_divergence_type', 'cv_enabled'))
 def update_agent(
     agent: BaseAgent,
     mag_agent: BaseAgent,
@@ -31,10 +39,18 @@ def update_agent(
     num_ppo_epoch: int,
     only_use_player0_experience: bool,
     mag_divergence_type: Literal["kl", "l2"] = "kl",
+    # Control Variate parameters
+    cv_enabled: bool = False,
+    cv_baseline_grad: Optional[Any] = None,
+    cv_rho_graphdef: Optional[Any] = None,
+    cv_rho_state: Optional[Any] = None,
+    cv_coefficient: float = 1.0,
+    cv_is_clip: float = 10.0,
 ) -> Tuple[BaseAgent, nnx.Optimizer, nnx.MultiMetric]:
     """
-    Updates agent parameters using PPO with optional magnetic regularization.
-    
+    Updates agent parameters using PPO with optional magnetic regularization
+    and optional Control Variate variance reduction.
+
     Args:
         agent: Agent to update
         optimizer: Optimizer state
@@ -42,12 +58,18 @@ def update_agent(
         metrics: Metrics collector
         key: Random key for shuffling
         ent_coef: Entropy regularization coefficient
-        mag_coef: Magnetic regularization coefficient  
+        mag_coef: Magnetic regularization coefficient
         clip_eps: PPO clipping parameter
         num_minibatches: Number of minibatches per epoch
         num_ppo_epoch: Number of training epochs
         only_use_player0_experience: If True, only train on player 0 data
         mag_agent: Optional magnetic agent for regularization
+        cv_enabled: Whether to enable Control Variate variance reduction
+        cv_baseline_grad: Baseline gradient g_bar_rho from snapshot phase
+        cv_rho_graphdef: GraphDef for reconstructing differentiable rho
+        cv_rho_state: State for reconstructing differentiable rho
+        cv_coefficient: CV correction strength (1.0 = full correction)
+        cv_is_clip: Maximum IS ratio for stability (clips to [1/clip, clip])
     Returns:
         Tuple of (updated_agent, updated_optimizer, updated_metrics)
     """
@@ -140,18 +162,44 @@ def update_agent(
             mag_kl = mag_kl,
             approx_kl = approx_kl,
             clip_frac = clip_frac,
-            explained_var = explained_var
+            explained_var = explained_var,
         )
 
         return total_loss
 
 
     def update_batch(carry: UpdateState, batch: train_types.Dataset):
-        """Update the agent for a single batch"""
-        # compute the gradient
+        """Update the agent for a single batch with optional CV correction"""
+        # Compute standard gradient from π
         grad = nnx.grad(calculate_n_log_loss)(carry.agent, batch, carry.metrics)
 
-        # update agent, optimizer state (inplace update)
+        # Apply Control Variate correction if enabled (cv_enabled is static)
+        if cv_enabled:
+            # Compute IS-weighted gradient through ρ
+            is_weighted_rho_grad, _ = compute_is_weighted_rho_gradient(
+                rho_graphdef=carry.cv_rho_graphdef,
+                rho_state=carry.cv_rho_state,
+                pi_agent=carry.agent,
+                batch=batch,
+                ent_coef=ent_coef,
+                is_clip=cv_is_clip,
+            )
+
+            # Apply CV correction: g_CV = g_π - c * (IS_weighted_g_ρ - ḡ_ρ)
+            # Get gradient state from grad (which is an agent with grad values)
+            _, pi_grad_state = nnx.split(grad)
+            cv_grad_state, _ = apply_cv_correction(
+                pi_grad=pi_grad_state,
+                is_weighted_rho_grad=is_weighted_rho_grad,
+                baseline_grad=carry.cv_baseline_grad,
+                cv_coefficient=cv_coefficient,
+            )
+
+            # Reconstruct grad with corrected gradient state
+            grad_graphdef, _ = nnx.split(grad)
+            grad = nnx.merge(grad_graphdef, cv_grad_state)
+
+        # Update agent and optimizer state (inplace update)
         carry.optimizer.update(grad)
 
         return carry, 0
@@ -182,7 +230,10 @@ def update_agent(
         agent=agent,
         optimizer=optimizer,
         metrics=metrics,
-        key=key
+        key=key,
+        cv_baseline_grad=cv_baseline_grad,
+        cv_rho_graphdef=cv_rho_graphdef,
+        cv_rho_state=cv_rho_state,
     )
 
     # perform ppo update for given epoch

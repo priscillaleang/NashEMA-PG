@@ -27,7 +27,7 @@ from omegaconf import DictConfig
 from envs import create_env
 import envs.mytypes as env_types
 from agents import create_agent, BaseAgent
-from train.core import collect_and_process_trajectories, update_agent
+from train.core import collect_and_process_trajectories, update_agent, compute_baseline_gradient
 from train.loggers import create_logger, BaseLogger
 
 
@@ -42,6 +42,10 @@ class LearnerState:
     train_metrics: nnx.MultiMetric
     rollout_metrics: nnx.MultiMetric
     mag_agent: Optional[BaseAgent] # use for regularization
+    # Control Variate fields
+    cv_baseline_grad: Optional[any] = None      # g_bar_rho PyTree
+    cv_rho_graphdef: Optional[any] = None       # For differentiable rho reconstruction
+    cv_rho_state: Optional[any] = None
 
 
 @partial(nnx.jit, static_argnames=('env', 'config'))
@@ -87,6 +91,13 @@ def single_training_step(
         num_minibatches = config.algorithm.num_minibatches,
         num_ppo_epoch = config.algorithm.num_ppo_epoch,
         only_use_player0_experience = False,
+        # Control Variate parameters
+        cv_enabled = config.algorithm.get('cv_enabled', False),
+        cv_baseline_grad = learner_state.cv_baseline_grad,
+        cv_rho_graphdef = learner_state.cv_rho_graphdef,
+        cv_rho_state = learner_state.cv_rho_state,
+        cv_coefficient = config.algorithm.get('cv_coefficient', 1.0),
+        cv_is_clip = config.algorithm.get('cv_is_clip', 10.0),
     )
 
     return learner_state, None
@@ -103,6 +114,48 @@ def training_step(
         partial(single_training_step, env=env, config=config),
         length=config.logging.log_interval,
     )(learner_state, None)
+
+    return learner_state
+
+
+@partial(nnx.jit, static_argnames=('env', 'config'))
+def compute_cv_baseline(
+        learner_state: LearnerState,
+        env: env_types.BaseEnv,
+        config: DictConfig
+    ) -> LearnerState:
+    """
+    Compute baseline gradient g_bar_rho at start of outer iteration.
+    At this point pi = rho, so IS ratio = 1.0 (no IS variance).
+    """
+    # Store rho's graphdef/state FIRST for differentiable reconstruction
+    graphdef, state = nnx.split(learner_state.mag_agent)
+    learner_state.cv_rho_graphdef = graphdef
+    learner_state.cv_rho_state = state
+
+    # Collect trajectories from pi (which equals rho at this point)
+    learner_state.key, collect_key = jax.random.split(learner_state.key)
+    learner_state.env_state, learner_state.last_timestep, learner_state.rollout_metrics, dataset = collect_and_process_trajectories(
+        env=env,
+        agent=learner_state.agent,
+        env_state=learner_state.env_state,
+        last_timestep=learner_state.last_timestep,
+        metrics=learner_state.rollout_metrics,
+        key=collect_key,
+        num_envs=config.algorithm.num_envs,
+        num_steps=config.algorithm.cv_num_snapshot_steps,
+        gamma=config.algorithm.gamma,
+        gae_gamma=config.algorithm.gae_gamma,
+    )
+
+    # Compute baseline gradient using differentiable rho copy (for consistency)
+    baseline_grad = compute_baseline_gradient(
+        rho_graphdef=graphdef,
+        rho_state=state,
+        dataset=dataset,
+        ent_coef=config.algorithm.ent_coef,
+    )
+    learner_state.cv_baseline_grad = baseline_grad
 
     return learner_state
 
@@ -184,6 +237,10 @@ def main(config: DictConfig):
     # training loop
     with tqdm(total=config.algorithm.num_inner_update * config.algorithm.num_outer_update, desc="Training") as pbar:
         for cur_num_outer_update in range(0, config.algorithm.num_outer_update):
+            # Snapshot phase: compute CV baseline at start of outer iteration
+            if config.algorithm.get('cv_enabled', False):
+                learner_state = compute_cv_baseline(learner_state, env, config)
+
             for cur_num_inner_update in range(0, config.algorithm.num_inner_update, config.logging.log_interval):
                 cur_num_update = cur_num_outer_update * config.algorithm.num_inner_update + cur_num_inner_update
                 
