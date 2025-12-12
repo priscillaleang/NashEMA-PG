@@ -21,3 +21,6 @@ dependencies = [
     "tqdm>=4.67.1",
     "uvicorn==0.24.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["agents*", "envs*", "train*", "wrappers*", "eval*", "conf*"]
